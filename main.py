@@ -18,6 +18,10 @@ def main(work_type_args):
         from parsers.reconstruction_synthetic import Parser
         from trainers.trainer_reconstruction_synthetic import Trainer
 
+    elif work_type_args.type == 'link_prediction':
+        from parsers.link_prediction import Parser
+        from trainers.trainer_link_prediction import Trainer
+
     else:
         raise ValueError("Work Type Name <{}> is Unknown".format(work_type_args.type))
 

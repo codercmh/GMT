@@ -1,6 +1,7 @@
 import os
 import time
 
+from torch_geometric.utils import add_self_loops, negative_sampling
 from tqdm import tqdm, trange
 
 import random
@@ -8,15 +9,40 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import Subset
 
 from transformers.optimization import get_cosine_schedule_with_warmup
 
-from torch_geometric.data import DataLoader
-from ogb.graphproppred import PygGraphPropPredDataset, Evaluator
+from torch_geometric.data import DataLoader, Dataset
+from ogb.linkproppred import PygLinkPropPredDataset, Evaluator
+
+#from torch_sparse import coalesce
 
 from utils.data import num_graphs
 from utils.logger import Logger
-from models.nets import GraphMultisetTransformer_for_OGB
+from models.nets import GraphMultisetTransformer_for_LinkPred
+
+class LinkPredictionCustomDataset(Dataset):
+    def __init__(self, pos_edges, neg_edges):
+        self.pos_edges = pos_edges  # 正样本链接数据
+        self.neg_edges = neg_edges  # 负样本链接数据
+        self.labels = [1] * pos_edges.size(0) + [0] * neg_edges.size(0)  # 1 表示正样本，0 表示负样本
+        self._indices = list(range(len(self.labels)))  # 初始化_indices属性
+        super(LinkPredictionCustomDataset, self).__init__()
+        #print('pos_edges',len(pos_edges),'neg_edges',len(neg_edges))
+
+    def len(self):
+        return len(self.labels)
+
+    def get(self, idx):
+        if self.labels[idx] == 1:
+            edge = self.pos_edges[idx]
+        else:
+            edge = self.neg_edges[idx]
+
+        label = self.labels[idx]
+
+        return edge, label
 
 class Trainer(object):
 
@@ -44,26 +70,94 @@ class Trainer(object):
         else:
             self.args.device = 'cpu'
 
-        self.dataset = self.load_data()
+        self.dataset, self.data = self.load_data()
 
         self.evaluator = Evaluator(args.data)
 
     def load_data(self):
 
-        dataset = PygGraphPropPredDataset(name = self.args.data, root = 'data')
-        self.args.task_type, self.args.num_features, self.args.num_classes, self.args.avg_num_nodes \
-            = dataset.task_type, dataset.num_features, dataset.num_tasks, np.ceil(np.mean([data.num_nodes for data in dataset]))
-        print('# %s: [Task]-%s [FEATURES]-%d [NUM_CLASSES]-%d [AVG_NODES]-%d' % (dataset, self.args.task_type, self.args.num_features, self.args.num_classes, self.args.avg_num_nodes))
+        dataset = PygLinkPropPredDataset(name = self.args.data, root = 'data')
+        self.args.task_type, self.args.num_features, self.args.num_nodes \
+            = dataset.task_type, dataset.num_features, dataset.num_nodes
+        print('# %s: [Task]-%s [FEATURES]-%d [NUM_NODES]-%d' %
+              (self.args.data, self.args.task_type, self.args.num_features, self.args.num_nodes))
+        data = dataset[0]
+        #print(data)
 
-        return dataset
+        return dataset, data
+
+    def get_pos_neg_edges(self):
+
+        #TODO:train_neg_edge,valid_neg_edge,test_neg_edge可能会有重复？
+        #TODO:valid_neg_edge,test_neg_edge的索引组数目不符合预期，始终是100000？
+
+        new_edge_index, _ = add_self_loops(self.data.edge_index)
+
+
+        if 'edge' in self.args.split_edge['train']:
+            train_pos_edge = self.args.split_edge['train']['edge'].t()
+            #print(train_pos_edge.size(1))
+
+            if 'edge_neg' in self.args.split_edge['train']:
+                train_neg_edge = self.args.split_edge['train']['edge_neg'].t()
+            else:
+                #new_edge_index, _ = add_self_loops(self.data.edge_index)
+                train_neg_edge = negative_sampling(
+                    new_edge_index, num_nodes=self.data.num_nodes,
+                    num_neg_samples=train_pos_edge.size(1))
+
+
+        if 'edge' in self.args.split_edge['valid']:
+            valid_pos_edge = self.args.split_edge['valid']['edge'].t()
+            #print(valid_pos_edge.size(1))
+
+            if 'edge_neg' in self.args.split_edge['valid']:
+                valid_neg_edge = self.args.split_edge['valid']['edge_neg'].t()
+            else:
+                #new_edge_index, _ = add_self_loops(self.data.edge_index)
+                valid_neg_edge = negative_sampling(
+                    new_edge_index, num_nodes=self.data.num_nodes,
+                    num_neg_samples=valid_pos_edge.size(1))
+
+
+        if 'edge' in self.args.split_edge['test']:
+            test_pos_edge = self.args.split_edge['test']['edge'].t()
+            #print(test_pos_edge.size(1))
+
+            if 'edge_neg' in self.args.split_edge['test']:
+                test_neg_edge = self.args.split_edge['test']['edge_neg'].t()
+            else:
+                #new_edge_index, _ = add_self_loops(self.data.edge_index)
+                test_neg_edge = negative_sampling(
+                    new_edge_index, num_nodes=self.data.num_nodes,
+                    num_neg_samples=test_pos_edge.size(1))
+
+        #print('train_pos_edge',train_pos_edge.shape,'train_neg_edge',train_neg_edge.shape)
+        #print('valid_pos_edge',valid_pos_edge.shape,'valid_neg_edge',valid_neg_edge.shape)
+        #print('test_pos_edge',test_pos_edge.shape,'test_neg_edge',test_neg_edge.shape)
+        return train_pos_edge, train_neg_edge, valid_pos_edge, valid_neg_edge, test_pos_edge, test_neg_edge
 
     def load_dataloader(self):
 
-        split_idx = self.dataset.get_idx_split()
+        split_edge = self.dataset.get_edge_split()
+        self.args.split_edge = split_edge
+        #print(split_edge['train']['edge'].shape[0], split_edge['valid']['edge'].shape[0], split_edge['test']['edge'].shape[0])
 
-        train_loader = DataLoader(self.dataset[split_idx["train"]], batch_size=self.args.batch_size, shuffle=True)
-        val_loader = DataLoader(self.dataset[split_idx["valid"]], batch_size=self.args.batch_size, shuffle=False)
-        test_loader = DataLoader(self.dataset[split_idx["test"]], batch_size=self.args.batch_size, shuffle=False)
+        #train_edges= split_edge['train']['edge'].tolist()
+        #valid_edges= split_edge['valid']['edge'].tolist()
+        #test_edges= split_edge['test']['edge'].tolist()
+        #print(len(train_edges), len(valid_edges), len(test_edges))
+
+        train_pos_edge, train_neg_edge, valid_pos_edge, valid_neg_edge, test_pos_edge, test_neg_edge = self.get_pos_neg_edges()
+
+        # 创建自定义数据集对象
+        train_dataset = LinkPredictionCustomDataset(train_pos_edge.t(), train_neg_edge.t())
+        valid_dataset = LinkPredictionCustomDataset(valid_pos_edge.t(), valid_neg_edge.t())
+        test_dataset = LinkPredictionCustomDataset(test_pos_edge.t(), test_neg_edge.t())
+
+        train_loader = DataLoader(train_dataset, batch_size=self.args.batch_size, shuffle=True)
+        val_loader = DataLoader(valid_dataset, batch_size=self.args.batch_size, shuffle=False)
+        test_loader = DataLoader(test_dataset, batch_size=self.args.batch_size, shuffle=False)
 
         return train_loader, val_loader, test_loader
 
@@ -71,7 +165,7 @@ class Trainer(object):
 
         if self.args.model == 'GMT':
 
-            model = GraphMultisetTransformer_for_OGB(self.args)
+            model = GraphMultisetTransformer_for_LinkPred(self.args)
 
         else:
 
@@ -112,9 +206,6 @@ class Trainer(object):
         self.model = self.load_model()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr = self.args.lr, weight_decay = self.args.weight_decay)
 
-        self.cls_criterion = torch.nn.BCEWithLogitsLoss()
-        self.reg_criterion = torch.nn.MSELoss()
-
         if self.args.lr_schedule:
             self.scheduler = get_cosine_schedule_with_warmup(self.optimizer, self.args.patience * len(train_loader), self.args.num_epochs * len(train_loader))
 
@@ -135,10 +226,7 @@ class Trainer(object):
 
                 is_labeled = data.y == data.y
 
-                if "classification" in self.args.task_type: 
-                    loss = self.cls_criterion(out.to(torch.float32)[is_labeled], data.y.to(torch.float32)[is_labeled])
-                else:
-                    loss = self.reg_criterion(out.to(torch.float32)[is_labeled], data.y.to(torch.float32)[is_labeled])
+                loss = torch.nn.BCEWithLogitsLoss()(out.to(torch.float32)[is_labeled], data.y.to(torch.float32)[is_labeled])
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_norm)
@@ -155,12 +243,8 @@ class Trainer(object):
 
         t_end = time.perf_counter()
 
-        if 'classification' in self.dataset.task_type:
-            best_val_epoch = np.argmax(np.array(self.valid_curve))
-            best_train = max(self.train_curve)
-        else:
-            best_val_epoch = np.argmin(np.array(self.valid_curve))
-            best_train = min(self.train_curve)
+        best_val_epoch = np.argmax(np.array(self.valid_curve))
+        best_train = max(self.train_curve)
 
         best_val = self.valid_curve[best_val_epoch]
         test_score = self.test_curve[best_val_epoch]
@@ -192,15 +276,16 @@ class Trainer(object):
             if batch.x.shape[0] == 1: pass
 
             with torch.no_grad():
-                pred = self.model(batch)
+                logits = self.model(batch)
 
-            y_true.append(batch.y.view(pred.shape).detach().cpu())
-            y_pred.append(pred.detach().cpu())
+            y_pred.append(logits.view(-1).cpu())
+            y_true.append(batch.y.view(-1).cpu().to(torch.float))
 
-        y_true = torch.cat(y_true, dim = 0).numpy()
-        y_pred = torch.cat(y_pred, dim = 0).numpy()
+        val_pred, val_true = torch.cat(y_pred), torch.cat(y_true)
+        y_pred_pos = val_pred[val_true == 1]
+        y_pred_neg = val_pred[val_true == 0]
 
-        input_dict = {"y_true": y_true, "y_pred": y_pred}
+        input_dict = {'y_pred_pos': y_pred_pos, 'y_pred_neg': y_pred_neg}
 
         return self.evaluator.eval(input_dict)
 

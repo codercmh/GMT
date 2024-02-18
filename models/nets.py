@@ -26,7 +26,7 @@ class GraphRepresentation(torch.nn.Module):
         self.num_classes = args.num_classes
         self.pooling_ratio = args.pooling_ratio
         self.dropout_ratio = args.dropout
-
+    # 构造卷积层
     def get_convs(self):
 
         convs = nn.ModuleList()
@@ -57,7 +57,7 @@ class GraphRepresentation(torch.nn.Module):
             _output_dim = _output_dim
 
         return convs
-
+    # 池化层
     def get_pools(self):
 
         pools = nn.ModuleList([gap])
@@ -81,9 +81,11 @@ class GraphMultisetTransformer(GraphRepresentation):
     def __init__(self, args):
 
         super(GraphMultisetTransformer, self).__init__(args)
-
+        # layer normalization
         self.ln = args.ln
+        # 多头数量
         self.num_heads = args.num_heads
+        # 是否聚类
         self.cluster = args.cluster
 
         self.model_sequence = args.model_string.split('-')
@@ -133,13 +135,13 @@ class GraphMultisetTransformer(GraphRepresentation):
 
         # For Classification
         x = self.classifier(x)
-
+        # 将输出标准化为概率
         return F.log_softmax(x, dim=-1)
 
     def get_pools(self, _input_dim=None, reconstruction=False):
 
         pools = nn.ModuleList()
-
+        # 由于jumping knowledge scheme
         _input_dim = self.nhid * self.args.num_convs if _input_dim is None else _input_dim
         _output_dim = self.nhid
         _num_nodes = ceil(self.pooling_ratio * self.args.avg_num_nodes)
@@ -255,6 +257,75 @@ class GraphMultisetTransformer_for_OGB(GraphMultisetTransformer):
             convs.append(conv)
 
         return convs
+
+class GraphMultisetTransformer_for_LinkPred(GraphMultisetTransformer):
+    def __init__(self, args):
+
+        super(GraphMultisetTransformer_for_LinkPred, self).__init__(args)
+
+        self.pools=self.get_pools()
+
+    def get_classifier(self):
+
+            return nn.Sequential(
+                nn.Linear(self.nhid, self.nhid),
+                nn.ReLU(),
+                nn.Dropout(p=self.dropout_ratio),
+                nn.Linear(self.nhid, self.nhid//2),
+                nn.ReLU(),
+                nn.Dropout(p=self.dropout_ratio),
+                nn.Linear(self.nhid//2, 1),
+                #使用 BCEWithLogitsLoss 作为损失函数时，模型的输出应该是 logits。Logits 是模型的原始输出，尚未经过激活函数（如 sigmoid）转换为概率值
+                #nn.Sigmoid()
+            )
+
+    def get_pools(self, _input_dim=None, reconstruction=False):
+
+        pools = nn.ModuleList()
+
+        _input_dim = self.nhid * self.args.num_convs if _input_dim is None else _input_dim
+        _output_dim = self.nhid
+        _num_nodes = ceil(self.pooling_ratio * self.args.num_nodes)
+
+        for _index, _model_str in enumerate(self.model_sequence):
+
+            if (_index == len(self.model_sequence) - 1) and (reconstruction == False):
+                _num_nodes = 1
+
+            if _model_str == 'GMPool_G':
+
+                pools.append(
+                    PMA(_input_dim, self.num_heads, _num_nodes, ln=self.ln, cluster=self.cluster,
+                        mab_conv=self.args.mab_conv)
+                )
+
+                _num_nodes = ceil(self.pooling_ratio * _num_nodes)
+
+            elif _model_str == 'GMPool_I':
+
+                pools.append(
+                    PMA(_input_dim, self.num_heads, _num_nodes, ln=self.ln, cluster=self.cluster, mab_conv=None)
+                )
+
+                _num_nodes = ceil(self.pooling_ratio * _num_nodes)
+
+            elif _model_str == 'SelfAtt':
+
+                pools.append(
+                    SAB(_input_dim, _output_dim, self.num_heads, ln=self.ln, cluster=self.cluster)
+                )
+
+                _input_dim = _output_dim
+                _output_dim = _output_dim
+
+            else:
+
+                raise ValueError("Model Name in Model String <{}> is Unknown".format(_model_str))
+
+        pools.append(nn.Linear(_input_dim, self.nhid))
+
+        return pools
+
 
 class GraphMultisetTransformer_for_Recon(GraphMultisetTransformer):
 

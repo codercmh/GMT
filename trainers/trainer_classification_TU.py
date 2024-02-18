@@ -56,7 +56,7 @@ class Trainer(object):
         return dataset
 
     def load_dataloader(self, fold_number, val_fold_number):
-
+        #这里的验证集定为上一个fold的测试集（如2的训练集，1的验证集，2的测试集）
         train_idxes = torch.as_tensor(np.loadtxt('./datasets/%s/10fold_idx/train_idx-%d.txt' % (self.args.data, fold_number),
                                                 dtype=np.int32), dtype=torch.long)
         val_idxes = torch.as_tensor(np.loadtxt('./datasets/%s/10fold_idx/test_idx-%d.txt' % (self.args.data, val_fold_number),
@@ -110,7 +110,7 @@ class Trainer(object):
         return logger, t_start
 
     def organize_val_log(self, logger, train_loss, val_loss, val_acc, fold_number, epoch):
-
+        #保存最好的模型且记录最好的验证集准确率、最好的验证集损失，并判断是否需要早停
         if val_loss < self.best_loss:
             torch.save(
                 self.model.state_dict(), 
@@ -174,6 +174,7 @@ class Trainer(object):
             self.model = self.load_model()
             self.optimizer = torch.optim.Adam(self.model.parameters(), lr = self.args.lr, weight_decay = self.args.weight_decay)
 
+            #训练过程中动态调整学习率（学习率余弦退火）
             if self.args.lr_schedule:
                 self.scheduler = get_cosine_schedule_with_warmup(self.optimizer, self.args.patience * len(train_loader), self.args.num_epochs * len(train_loader))
 
@@ -198,7 +199,7 @@ class Trainer(object):
 
                     if self.args.lr_schedule:
                         self.scheduler.step()
-
+                #不同batch的加权平均，权重为batch中的图数量
                 total_loss = total_loss / len(train_loader.dataset)
 
                 # Validation
@@ -252,7 +253,7 @@ class Trainer(object):
 
         ts = time.strftime('%Y-%b-%d-%H:%M:%S', time.gmtime())
 
-        self.log_folder_name = os.path.join(*[self.args.data, self.args.model, self.args.experiment_number])
+        self.log_folder_name = os.path.join(*[self.args.data, self.args.model, self.args.experiment_number]).replace('\\','/')
 
         if not(os.path.isdir('./checkpoints/{}'.format(self.log_folder_name))):
             os.makedirs(os.path.join('./checkpoints/{}'.format(self.log_folder_name)))
@@ -282,7 +283,7 @@ class Trainer(object):
         exp_name += "LS={}_".format(self.args.lr_schedule)
         exp_name += "CS={}_".format(self.args.cluster)
         exp_name += "NM={}_".format(self.args.normalize)
-        exp_name += "TS={}".format(ts)
+        #exp_name += "TS={}".format(ts)
 
         # Save training arguments for reproduction
         torch.save(self.args, os.path.join('./checkpoints/{}'.format(self.log_folder_name), 'training_args.bin'))
